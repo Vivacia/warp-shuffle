@@ -1,0 +1,46 @@
+For 1000 rounds:
+  CUDA Warp Shuffle Benchmarks
+
+  Average time to run CUDA __shfl_sync() = 0.271266 ms
+  Average time to run custom shfl_sync() = 0.028775 ms
+
+  Average time to run CUDA __shfl_up_sync() = 0.028799 ms
+  Average time to run custom shfl_up_sync() = 0.030018 ms
+
+  Average time to run CUDA __shfl_down_sync() = 0.030045 ms
+  Average time to run custom shfl_down_sync() = 0.030277 ms
+
+  Average time to run CUDA __shfl_xor_sync() = 0.026366 ms
+  Average time to run custom shfl_xor_sync() = 0.029148 ms
+
+
+For 100 rounds:
+  CUDA Warp Shuffle Benchmarks
+
+  Average time to run CUDA __shfl_sync() = 2.659710 ms
+  Average time to run custom shfl_sync() = 0.026520 ms
+
+  Average time to run CUDA __shfl_up_sync() = 0.026490 ms
+  Average time to run custom shfl_up_sync() = 0.033470 ms
+
+  Average time to run CUDA __shfl_down_sync() = 0.024750 ms
+  Average time to run custom shfl_down_sync() = 0.026360 ms
+
+  Average time to run CUDA __shfl_xor_sync() = 0.024640 ms
+  Average time to run custom shfl_xor_sync() = 0.026920 ms
+
+
+For 10 rounds:
+  CUDA Warp Shuffle Benchmarks
+
+  Average time to run CUDA __shfl_sync() = 23.775500 ms
+  Average time to run custom shfl_sync() = 0.033300 ms
+
+  Average time to run CUDA __shfl_up_sync() = 0.033300 ms
+  Average time to run custom shfl_up_sync() = 0.035700 ms
+
+  Average time to run CUDA __shfl_down_sync() = 0.033700 ms
+  Average time to run custom shfl_down_sync() = 0.028000 ms
+
+  Average time to run CUDA __shfl_xor_sync() = 0.029100 ms
+  Average time to run custom shfl_xor_sync() = 0.031100 ms

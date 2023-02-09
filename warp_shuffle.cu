@@ -1,6 +1,8 @@
 #include <cstdio>
+#include <stdio.h>
 #include <cstdlib>
 #include <math.h>
+#include <sys/time.h>
 
 #define checkCudaErrors(call)                                 \
   do {                                                        \
@@ -23,248 +25,405 @@
  * var = variable to get the value from, which is different for each thread.
 */
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+// WARP SHUFFLE FUNCTION IMPLEMENTATIONS
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 /*
  * T __shfl_sync(unsigned mask, T var, int srcLane, int width=warpSize)
  * returns the value of var held by the thread whose ID is given by srcLane.
  */
-__global__ void shfl_sync(int* shared_var_arr, size_t* width,
-    unsigned* mask, int* srcLane, size_t* warp_size) {
+__device__ unsigned shfl_up_sync_shared_var_arr[32];
+__device__ bool shfl_up_sync_updated[32] = {0, 0, 0, 0, 0, 0,
+0, 0, 0, 0, 0, 0, 0,0, 0, 0, 0,
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+0, 0, 0, 0};
+
+__device__ unsigned shfl_up_sync(unsigned mask, unsigned var, unsigned int delta, int width=warpSize) {
     int tid = threadIdx.x;
-    if (((0x1 << tid) & *mask) != 0) {
-        // If srcLane is outside the range [0:width-1],
-        // the value returned corresponds to the value of var
-        // held by the srcLane modulo width (i.e. within the same subsection)
-        *srcLane = (floor((float)tid / (float)*width) * *width) + *srcLane % (*width-1);
-        if (*srcLane > *warp_size)
-            return;
-        shared_var_arr[tid] = shared_var_arr[*srcLane];
+
+    shfl_up_sync_shared_var_arr[tid] = var;
+    shfl_up_sync_updated[tid] = true;
+
+    if (((0x1 << tid) & mask) != 0) {
+        int sub_id = floor((float) tid / (float) width); // subsection
+        int sub_tid = tid % width;
+        int srcLane = sub_tid - delta;
+        if (srcLane >= 0) {
+            while(!shfl_up_sync_updated[srcLane + (width * sub_id)]);
+            var = shfl_up_sync_shared_var_arr[srcLane + (width * sub_id)];
+            shfl_up_sync_updated[srcLane + (width * sub_id)] = false; // reset
+        }
     }
+    return var;
 }
 
-void shfl_sync_setup(int* _shared_var_arr, size_t _width,
-    unsigned _mask, int _srcLane, size_t _warp_size) {
-    int* shared_var_arr;
-    size_t* width;
-    unsigned* mask;
-    int* srcLane;
-    size_t* warp_size;
+__device__ unsigned shfl_down_sync_shared_var_arr[32];
+__device__ bool shfl_down_sync_updated[32] = {0, 0, 0, 0, 0, 0,
+0, 0, 0, 0, 0, 0, 0,0, 0, 0, 0,
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+0, 0, 0, 0};
 
-    checkCudaErrors(cudaMalloc((void**) &width,
-        sizeof(size_t)));
-    checkCudaErrors(cudaMemcpy(width, &_width,
-        sizeof(size_t), cudaMemcpyHostToDevice));
-    
-    checkCudaErrors(cudaMalloc((void**) &shared_var_arr,
-        *width * sizeof(int)));
-    checkCudaErrors(cudaMemcpy(shared_var_arr, &_shared_var_arr,
-        *width * sizeof(int), cudaMemcpyHostToDevice));
-    
-    checkCudaErrors(cudaMalloc((void**) &mask, sizeof(unsigned)));
-    checkCudaErrors(cudaMemcpy(mask, &_mask,
-        sizeof(unsigned), cudaMemcpyHostToDevice));
-
-    checkCudaErrors(cudaMalloc((void**) &srcLane, sizeof(int)));
-    checkCudaErrors(cudaMemcpy(srcLane, &_srcLane,
-        sizeof(int), cudaMemcpyHostToDevice));
-
-    checkCudaErrors(cudaMalloc((void**) &warp_size,
-        sizeof(size_t)));
-    checkCudaErrors(cudaMemcpy(warp_size, &_warp_size,
-        sizeof(size_t), cudaMemcpyHostToDevice));
-     
-    shfl_sync<<<1, _width>>>(shared_var_arr, width, mask, srcLane, warp_size);
-}
-
-/**
- * __shfl_up_sync() calculates a source lane ID by subtracting delta from the caller's lane ID.
- * The value of var held by the resulting lane ID is returned:
- * in effect, var is shifted up the warp by delta lanes.
- * If width is less than warpSize then each subsection of the warp behaves as a
- * separate entity with a starting logical lane ID of 0.
- * The source lane index will not wrap around the value of width,
- * so effectively the lower delta lanes will be unchanged.
- * T __shfl_up_sync(unsigned mask, T var, unsigned delta, int width=warpSize)
- */
-__global__ void shfl_up_sync(int* shared_var_arr, size_t* width,
-    unsigned* mask, unsigned* delta, size_t* warp_size) {
+__device__ unsigned shfl_down_sync(unsigned mask, unsigned var, unsigned int delta, int width=warpSize) {
     int tid = threadIdx.x;
-    if (((0x1 << tid) & *mask) != 0) {
-        int sub_id = floor((float)tid / (float)*width); // subsection
-        int sub_tid = tid % *width;
-        int srcLane = sub_tid - *delta;
-        if (srcLane < 0)
-            return;
-        shared_var_arr[tid] = shared_var_arr[srcLane + (*width * sub_id)];
+
+    shfl_down_sync_shared_var_arr[tid] = var;
+    shfl_down_sync_updated[tid] = true;
+
+    if (((0x1 << tid) & mask) != 0) {
+        int sub_id = floor((float) tid / (float) width); // subsection
+        int sub_tid = tid % width;
+        int srcLane = sub_tid + delta;
+        if (srcLane < width) {
+            while(!shfl_down_sync_updated[srcLane + (width * sub_id)]);
+            var = shfl_down_sync_shared_var_arr[srcLane + (width * sub_id)];
+            shfl_down_sync_updated[srcLane + (width * sub_id)] = false; // reset
+        }
     }
+    return var;
 }
 
-void shfl_up_sync_setup(int* _shared_var_arr, size_t _width,
-    unsigned _mask, unsigned _delta, size_t _warp_size) {
-    int* shared_var_arr;
-    size_t* width;
-    unsigned* mask;
-    unsigned* delta;
-    size_t* warp_size;
+__device__ unsigned shfl_sync_shared_var_arr[32];
+__device__ bool shfl_sync_updated[32] = {0, 0, 0, 0, 0, 0,
+0, 0, 0, 0, 0, 0, 0,0, 0, 0, 0,
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+0, 0, 0, 0};
 
-    checkCudaErrors(cudaMalloc((void**) &width,
-        sizeof(size_t)));
-    checkCudaErrors(cudaMemcpy(width, &_width,
-        sizeof(size_t), cudaMemcpyHostToDevice));
-    
-    checkCudaErrors(cudaMalloc((void**) &shared_var_arr,
-        *width * sizeof(int)));
-    checkCudaErrors(cudaMemcpy(shared_var_arr, &_shared_var_arr,
-        *width * sizeof(int), cudaMemcpyHostToDevice));
-    
-    checkCudaErrors(cudaMalloc((void**) &mask, sizeof(unsigned)));
-    checkCudaErrors(cudaMemcpy(mask, &_mask,
-        sizeof(unsigned), cudaMemcpyHostToDevice));
-
-    checkCudaErrors(cudaMalloc((void**) &delta, sizeof(int)));
-    checkCudaErrors(cudaMemcpy(delta, &_delta,
-        sizeof(int), cudaMemcpyHostToDevice));
-
-    checkCudaErrors(cudaMalloc((void**) &warp_size,
-        sizeof(size_t)));
-    checkCudaErrors(cudaMemcpy(warp_size, &_warp_size,
-        sizeof(size_t), cudaMemcpyHostToDevice));
-     
-    shfl_up_sync<<<1, _width>>>(shared_var_arr, width, mask, delta, warp_size);
-}
-
-/**
- * __shfl_down_sync() calculates a source lane ID by adding delta to the caller's lane ID.
- * The value of var held by the resulting lane ID is returned:
- * this has the effect of shifting var down the warp by delta lanes.
- * If width is less than warpSize then each subsection of the warp behaves as a
- * separate entity with a starting logical lane ID of 0. As for __shfl_up_sync(),
- * the ID number of the source lane will not wrap around the value of width and
- * so the upper delta lanes will remain unchanged.
- * T __shfl_down_sync(unsigned mask, T var, unsigned delta, int width=warpSize)
- */
-__global__ void shfl_down_sync(int* shared_var_arr, size_t* width,
-    unsigned* mask, unsigned* delta, size_t* warp_size) {
+__device__ unsigned shfl_sync(unsigned mask, unsigned var, int srcLane, int width=warpSize) {
     int tid = threadIdx.x;
-    if (((0x1 << tid) & *mask) != 0) {
-        int sub_id = floor((float)tid / (float)*width); // subsection
-        int sub_tid = tid % *width;
-        int srcLane = sub_tid + *delta;
-        if (srcLane >= *width)
-            return;
-        shared_var_arr[tid] = shared_var_arr[srcLane + (*width * sub_id)];
+
+    shfl_sync_shared_var_arr[tid] = var;
+    shfl_sync_updated[tid] = true;
+
+    if (((0x1 << tid) & mask) != 0) {
+        if (srcLane >= 0) {
+            while(!shfl_sync_updated[srcLane]);
+            var = shfl_sync_shared_var_arr[srcLane];
+            shfl_sync_updated[srcLane] = false;
+        }
     }
+    return var;
 }
 
-void shfl_down_sync_setup(int* _shared_var_arr, size_t _width,
-    unsigned _mask, unsigned _delta, size_t _warp_size) {
-    int* shared_var_arr;
-    size_t* width;
-    unsigned* mask;
-    unsigned* delta;
-    size_t* warp_size;
+__device__ unsigned shfl_xor_sync_shared_var_arr[32];
+__device__ bool shfl_xor_sync_updated[32] = {0, 0, 0, 0, 0, 0,
+0, 0, 0, 0, 0, 0, 0,0, 0, 0, 0,
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+0, 0, 0, 0};
 
-    checkCudaErrors(cudaMalloc((void**) &width,
-        sizeof(size_t)));
-    checkCudaErrors(cudaMemcpy(width, &_width,
-        sizeof(size_t), cudaMemcpyHostToDevice));
-    
-    checkCudaErrors(cudaMalloc((void**) &shared_var_arr,
-        *width * sizeof(int)));
-    checkCudaErrors(cudaMemcpy(shared_var_arr, &_shared_var_arr,
-        *width * sizeof(int), cudaMemcpyHostToDevice));
-    
-    checkCudaErrors(cudaMalloc((void**) &mask, sizeof(unsigned)));
-    checkCudaErrors(cudaMemcpy(mask, &_mask,
-        sizeof(unsigned), cudaMemcpyHostToDevice));
-
-    checkCudaErrors(cudaMalloc((void**) &delta, sizeof(int)));
-    checkCudaErrors(cudaMemcpy(delta, &_delta,
-        sizeof(int), cudaMemcpyHostToDevice));
-
-    checkCudaErrors(cudaMalloc((void**) &warp_size,
-        sizeof(size_t)));
-    checkCudaErrors(cudaMemcpy(warp_size, &_warp_size,
-        sizeof(size_t), cudaMemcpyHostToDevice));
-    
-    /*
-    #define FULL_MASK 0xffffffff
-    for (int offset = 16; offset > 0; offset /= 2)
-        val += __shfl_down_sync(FULL_MASK, val, offset);
-    */
-    for (*delta = 16; *delta > 0; *delta /= 2) {
-        shfl_down_sync<<<1, _width>>>(shared_var_arr, width, mask, delta, warp_size);
-    }
-}
-
-/**
- * __shfl_xor_sync() calculates a source line ID by performing a bitwise XOR of the
- * caller's lane ID with laneMask: the value of var held by the resulting lane ID is returned.
- * If width is less than warpSize then each group of width consecutive threads are
- * able to access elements from earlier groups of threads, however if they attempt
- * to access elements from later groups of threads their own value of var will be returned.
- * This mode implements a butterfly addressing pattern such as is used in tree reduction and broadcast.
- * T __shfl_xor_sync(unsigned mask, T var, int laneMask, int width=warpSize) 
- */
-__global__ void shfl_xor_sync(int* shared_var_arr, size_t* width,
-    unsigned* mask, int* laneMask, size_t* warp_size) {
+__device__ unsigned shfl_xor_sync(unsigned mask, unsigned var, int laneMask, int width=warpSize) {
     int tid = threadIdx.x;
-    if (((0x1 << tid) & *mask) != 0) {
-        int sub_id = floor((float)tid / (float)*width); // subsection
-        int sub_tid = tid % *width;
-        int srcLane = sub_tid ^ *laneMask;
-        int src_sub_id = floor((float)srcLane / (float)*width);
-        if (src_sub_id > sub_id)
-            return;
-        shared_var_arr[tid] = shared_var_arr[srcLane + (*width * src_sub_id)];
+
+    shfl_xor_sync_shared_var_arr[tid] = var;
+    shfl_xor_sync_updated[tid] = true;
+
+    if (((0x1 << tid) & mask) != 0) {
+        int sub_id = floor((float) tid / (float) width);
+        int sub_tid = tid % width;
+        int srcLane = sub_tid ^ laneMask;
+        int src_sub_id = floor((float) srcLane / (float) width);
+        if (src_sub_id <= sub_id) {
+            while(!shfl_xor_sync_updated[srcLane + (width * src_sub_id)]);
+            var = shfl_xor_sync_shared_var_arr[srcLane + (width * src_sub_id)];
+            shfl_xor_sync_updated[srcLane + (width * src_sub_id)] = false; // reset
+        }
     }
+    return var;
 }
 
-void shfl_xor_sync_setup(int* _shared_var_arr, size_t _width,
-    unsigned _mask, int _laneMask, size_t _warp_size) {
-    int* shared_var_arr;
-    size_t* width;
-    unsigned* mask;
-    int* laneMask;
-    size_t* warp_size;
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+// WARP SHUFFLE FUNCTION BENCHMARKS
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    checkCudaErrors(cudaMalloc((void**) &width,
-        sizeof(size_t)));
-    checkCudaErrors(cudaMemcpy(width, &_width,
-        sizeof(size_t), cudaMemcpyHostToDevice));
-    
-    checkCudaErrors(cudaMalloc((void**) &shared_var_arr,
-        *width * sizeof(int)));
-    checkCudaErrors(cudaMemcpy(shared_var_arr, &_shared_var_arr,
-        *width * sizeof(int), cudaMemcpyHostToDevice));
-    
-    checkCudaErrors(cudaMalloc((void**) &mask, sizeof(unsigned)));
-    checkCudaErrors(cudaMemcpy(mask, &_mask,
-        sizeof(unsigned), cudaMemcpyHostToDevice));
+// For benchmarking
+const int NUM_ROUNDS = 1000;
 
-    checkCudaErrors(cudaMalloc((void**) &laneMask, sizeof(int)));
-    checkCudaErrors(cudaMemcpy(laneMask, &_laneMask,
-        sizeof(int), cudaMemcpyHostToDevice));
+// WARP SHFL_SYNC /////////////////////////////////////////////////////////////////////////////////////////
+// from https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#broadcast-of-a-single-value-across-a-warp
+// Broadcast of a single value across a warp
 
-    checkCudaErrors(cudaMalloc((void**) &warp_size,
-        sizeof(size_t)));
-    checkCudaErrors(cudaMemcpy(warp_size, &_warp_size,
-        sizeof(size_t), cudaMemcpyHostToDevice));
-     
-    shfl_sync<<<1, _width>>>(shared_var_arr, width, mask, laneMask, warp_size);
+__global__ void test_shfl_sync_default(int arg) {
+    int laneId = threadIdx.x & 0x1f;
+    int value;
+    if (laneId == 0)        // Note unused variable for
+        value = arg;        // all threads except lane 0
+    // Synchronize all threads in warp, and get "value" from lane 0
+    value = __shfl_sync(0xffffffff, value, 0);
+    if (value != arg)
+        printf("Thread %d failed.\n", threadIdx.x);
 }
 
-int main(int argc, char *argv[]) {
-    int *_shared_var_arr;
-    size_t warp_size = 32;
-    size_t width = 32;
-    unsigned mask = 0xffffffff;
-    int delta = 0;
+__global__ void test_shfl_sync_custom(int arg) {
+    int laneId = threadIdx.x & 0x1f;
+    int value;
+    if (laneId == 0)        // Note unused variable for
+        value = arg;        // all threads except lane 0
+    // Synchronize all threads in warp, and get "value" from lane 0
+    value = shfl_sync(0xffffffff, value, 0);
+    if (value != arg)
+        printf("Thread %d failed.\n", threadIdx.x);
+}
 
-    checkCudaErrors(cudaMalloc((void**) &_shared_var_arr,
-        width * sizeof(int)));
-    for (int i = 0; i < warp_size; i++) {
-        _shared_var_arr[i] = 1;
+void benchmark_shfl_sync() {
+    double total_default_time = 0;
+    double total_custom_time = 0;
+
+    for (int i = 0; i < NUM_ROUNDS; i++) {
+        struct timeval start_default, end_default;
+        gettimeofday(&start_default, 0);
+        test_shfl_sync_default<<< 1, 32 >>>(1234);
+        checkCudaErrors(cudaDeviceSynchronize());
+        gettimeofday(&end_default, 0);
+        double duration_default = (1000000.0*(end_default.tv_sec-start_default.tv_sec)
+            + end_default.tv_usec-start_default.tv_usec)/1000.0;
+        total_default_time += duration_default;
+
+        struct timeval start_custom, end_custom;
+        gettimeofday(&start_custom, 0);
+        test_shfl_sync_custom<<< 1, 32 >>>(1234);
+        checkCudaErrors(cudaDeviceSynchronize());
+        gettimeofday(&end_custom, 0);
+        double duration_custom = (1000000.0*(end_custom.tv_sec-start_custom.tv_sec)
+            + end_custom.tv_usec-start_custom.tv_usec)/1000.0;
+        total_custom_time += duration_custom;
     }
-    
-    shfl_down_sync_setup(_shared_var_arr, width, mask, delta, warp_size);
+
+    double avg_default = total_default_time / NUM_ROUNDS;
+    double avg_custom = total_custom_time / NUM_ROUNDS;
+
+    printf("  Average time to run CUDA __shfl_sync() = %f ms\n", avg_default);
+    printf("  Average time to run custom shfl_sync() = %f ms\n\n", avg_custom);
+}
+
+
+// WARP SHFL_UP_SYNC //////////////////////////////////////////////////////////////////////////////////
+// from https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#inclusive-plus-scan-across-sub-partitions-of-8-threads
+// Inclusive plus-scan across sub-partitions of 8 threads
+
+__device__ unsigned default_results_shfl_up[32];
+__device__ unsigned custom_results_shfl_up[32];
+
+__global__ void test_shfl_up_sync_default() {
+    int laneId = threadIdx.x & 0x1f;
+    // Seed sample starting value (inverse of lane ID)
+    unsigned value = 31 - laneId;
+
+    // Loop to accumulate scan within my partition.
+    // Scan requires log2(n) == 3 steps for 8 threads
+    // It works by an accumulated sum up the warp
+    // by 1, 2, 4, 8 etc. steps.
+    for (int i=1; i<=4; i*=2) {
+        // We do the __shfl_sync unconditionally so that we
+        // can read even from threads which won't do a
+        // sum, and then conditionally assign the result.
+        unsigned n = __shfl_up_sync(0xffffffff, value, i, 8);
+        if ((laneId & 7) >= i)
+            value += n;
+    }
+
+    // printf("Default thread %d final value = %d\n", threadIdx.x, value);
+}
+
+__global__ void test_shfl_up_sync_custom() {
+    int laneId = threadIdx.x & 0x1f;
+    // Seed sample starting value (inverse of lane ID)
+    unsigned value = 31 - laneId;
+
+    // Loop to accumulate scan within my partition.
+    // Scan requires log2(n) == 3 steps for 8 threads
+    // It works by an accumulated sum up the warp
+    // by 1, 2, 4, 8 etc. steps.
+    for (int i=1; i<=4; i*=2) {
+        // We do the __shfl_sync unconditionally so that we
+        // can read even from threads which won't do a
+        // sum, and then conditionally assign the result.
+        unsigned n = shfl_up_sync(0xffffffff, value, i, 8);
+        if ((laneId & 7) >= i)
+            value += n;
+    }
+
+    // printf("Custom thread %d final value = %d\n", threadIdx.x, value);
+}
+
+void benchmark_shfl_up_sync() {
+    double total_default_time = 0;
+    double total_custom_time = 0;
+
+    for (int i = 0; i < NUM_ROUNDS; i++) {
+        struct timeval start_default, end_default;
+        gettimeofday(&start_default, 0);
+        test_shfl_up_sync_default<<< 1, 32 >>>();
+        checkCudaErrors(cudaDeviceSynchronize());
+        gettimeofday(&end_default, 0);
+        double duration_default = (1000000.0*(end_default.tv_sec-start_default.tv_sec)
+            + end_default.tv_usec-start_default.tv_usec)/1000.0;
+        total_default_time += duration_default;
+
+        struct timeval start_custom, end_custom;
+        gettimeofday(&start_custom, 0);
+        test_shfl_up_sync_custom<<< 1, 32 >>>();
+        checkCudaErrors(cudaDeviceSynchronize());
+        gettimeofday(&end_custom, 0);
+        double duration_custom = (1000000.0*(end_custom.tv_sec-start_custom.tv_sec)
+            + end_custom.tv_usec-start_custom.tv_usec)/1000.0;
+        total_custom_time += duration_custom;
+    }
+
+    double avg_default = total_default_time / NUM_ROUNDS;
+    double avg_custom = total_custom_time / NUM_ROUNDS;
+
+    printf("  Average time to run CUDA __shfl_up_sync() = %f ms\n", avg_default);
+    printf("  Average time to run custom shfl_up_sync() = %f ms\n\n", avg_custom);
+}
+
+
+// WARP SHFL_DOWN_SYNC ///////////////////////////////////////////////////////////////////////////////
+// https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/
+// Warp reduce sum
+
+__device__ unsigned default_results_shfl_down[32];
+__device__ unsigned custom_results_shfl_down[32];
+
+__global__ void test_shfl_down_sync_default() {
+    int laneId = threadIdx.x & 0x1f;
+    // Seed sample starting value (inverse of lane ID)
+    unsigned value = 31 - laneId;
+
+    // Loop to accumulate scan within my partition.
+    // Scan requires log2(n) == 3 steps for 8 threads
+    // It works by an accumulated sum up the warp
+    // by 1, 2, 4, 8 etc. steps.
+    for (int i=1; i<=4; i*=2) {
+        // We do the __shfl_sync unconditionally so that we
+        // can read even from threads which won't do a
+        // sum, and then conditionally assign the result.
+        unsigned n = __shfl_down_sync(0xffffffff, value, i, 8);
+        if ((laneId & 7) <= i)
+            value += n;
+    }
+
+    // printf("Default thread %d final value = %d\n", threadIdx.x, value);
+}
+
+__global__ void test_shfl_down_sync_custom() {
+    int laneId = threadIdx.x & 0x1f;
+    // Seed sample starting value (inverse of lane ID)
+    unsigned value = 31 - laneId;
+
+    // Loop to accumulate scan within my partition.
+    // Scan requires log2(n) == 3 steps for 8 threads
+    // It works by an accumulated sum up the warp
+    // by 1, 2, 4, 8 etc. steps.
+    for (int i=1; i<=4; i*=2) {
+        // We do the __shfl_sync unconditionally so that we
+        // can read even from threads which won't do a
+        // sum, and then conditionally assign the result.
+        unsigned n = shfl_down_sync(0xffffffff, value, i, 8);
+        if ((laneId & 7) <= i)
+            value += n;
+    }
+
+    // printf("Custom thread %d final value = %d\n", threadIdx.x, value);
+}
+
+unsigned test_array[32];
+
+void benchmark_shfl_down_sync() {
+    double total_default_time = 0;
+    double total_custom_time = 0;
+
+    for (int i = 0; i < NUM_ROUNDS; i++) {
+            struct timeval start_default, end_default;
+        gettimeofday(&start_default, 0);
+        test_shfl_down_sync_default<<< 1, 32 >>>(); // 1234
+        checkCudaErrors(cudaDeviceSynchronize());
+        gettimeofday(&end_default, 0);
+        double duration_default = (1000000.0*(end_default.tv_sec-start_default.tv_sec)
+            + end_default.tv_usec-start_default.tv_usec)/1000.0;
+        total_default_time += duration_default;
+
+        struct timeval start_custom, end_custom;
+        gettimeofday(&start_custom, 0);
+        test_shfl_down_sync_custom<<< 1, 32 >>>();
+        checkCudaErrors(cudaDeviceSynchronize());
+        gettimeofday(&end_custom, 0);
+        double duration_custom = (1000000.0*(end_custom.tv_sec-start_custom.tv_sec)
+            + end_custom.tv_usec-start_custom.tv_usec)/1000.0;
+        total_custom_time += duration_custom;
+    }
+
+    double avg_default = total_default_time / NUM_ROUNDS;
+    double avg_custom = total_custom_time / NUM_ROUNDS;
+
+    printf("  Average time to run CUDA __shfl_down_sync() = %f ms\n", avg_default);
+    printf("  Average time to run custom shfl_down_sync() = %f ms\n\n", avg_custom);
+}
+
+
+// WARP SHFL_XOR_SYNC //////////////////////////////////////////////////////////////////////////////
+// https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#reduction-across-a-warp
+
+__device__ unsigned default_results_shfl_xor[32];
+__device__ unsigned custom_results_shfl_xor[32];
+
+__global__ void test_shfl_xor_sync_default() {
+    int laneId = threadIdx.x & 0x1f;
+    // Seed starting value as inverse lane ID
+    unsigned value = 31 - laneId;
+
+    // Use XOR mode to perform butterfly reduction
+    for (int i=16; i>=1; i/=2)
+        value += __shfl_xor_sync(0xffffffff, value, i, 32);
+    // printf("Default thread %d final value = %d\n", threadIdx.x, value);
+}
+
+__global__ void test_shfl_xor_sync_custom() {
+    int laneId = threadIdx.x & 0x1f;
+    // Seed starting value as inverse lane ID
+    unsigned value = 31 - laneId;
+
+    // Use XOR mode to perform butterfly reduction
+    for (int i=16; i>=1; i/=2)
+        value += shfl_xor_sync(0xffffffff, value, i, 32);
+    // printf("Custom thread %d final value = %d\n", threadIdx.x, value);
+}
+
+void benchmark_shfl_xor_sync() {
+    double total_default_time = 0;
+    double total_custom_time = 0;
+
+    for (int i = 0; i < NUM_ROUNDS; i++) {
+        struct timeval start_default, end_default;
+        gettimeofday(&start_default, 0);
+        test_shfl_xor_sync_default<<< 1, 32 >>>();
+        checkCudaErrors(cudaDeviceSynchronize());
+        gettimeofday(&end_default, 0);
+        double duration_default = (1000000.0*(end_default.tv_sec-start_default.tv_sec)
+            + end_default.tv_usec-start_default.tv_usec)/1000.0;
+        total_default_time += duration_default;
+
+        struct timeval start_custom, end_custom;
+        gettimeofday(&start_custom, 0);
+        test_shfl_xor_sync_custom<<< 1, 32 >>>();
+        checkCudaErrors(cudaDeviceSynchronize());
+        gettimeofday(&end_custom, 0);
+        double duration_custom = (1000000.0*(end_custom.tv_sec-start_custom.tv_sec)
+            + end_custom.tv_usec-start_custom.tv_usec)/1000.0;
+        total_custom_time += duration_custom;
+    }
+
+    double avg_default = total_default_time / NUM_ROUNDS;
+    double avg_custom = total_custom_time / NUM_ROUNDS;
+
+    printf("  Average time to run CUDA __shfl_xor_sync() = %f ms\n", avg_default);
+    printf("  Average time to run custom shfl_xor_sync() = %f ms\n\n", avg_custom);
+}
+
+int main() {
+    printf("CUDA Warp Shuffle Benchmarks\n\n");
+    benchmark_shfl_sync();
+    benchmark_shfl_up_sync();
+    benchmark_shfl_down_sync();
+    benchmark_shfl_xor_sync();
+    return 0;
 }

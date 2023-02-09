@@ -83,6 +83,14 @@ __device__ unsigned shufl_xor_sync(unsigned mask, unsigned var, int laneMask, in
     }
     return var;
 }
+// #include <time.h>
+// to randomly create an array
+// srand(time(0));   
+// unsigned correct_sum = 0;
+// for (int i = 0; i < 32; i++) {
+//     test_array[i] = rand() % 1000;
+//     correct_sum += test_array[i];
+// }
 
 // REDUCE
 
